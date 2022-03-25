@@ -163,8 +163,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--autoplan",
-        type=bool,
-        default=True,
+        type=int,
+        default=1,
         help="Auto plan or use `pooling_factor_per_feature`",
     )
     ################################ dense layer
@@ -210,11 +210,13 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--logs_dirname",
         type=str,
+        default='/tmp/torchrec',
         help="Logs dirname",
     )
     parser.add_argument(
         "--plans_dirname",
         type=str,
+        default='/tmp/torchrec',
         help="Plans dirname",
     )
     ################################ other args
@@ -243,27 +245,33 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         default=0.1,
         help="Learning rate.",
     )
+    parser.add_argument(
+        "--from_env",
+        action="store_true",
+        help="Ignore parsed parameters, and read from environmental variables.",
+    )
     
     parser.set_defaults(pin_memory=None)
     args = parser.parse_args(argv)
-    from_env_args = [
-        'batch_size',
-        'dataset_type',
-        'embedding_dim_per_feature',
-        'pooling_factor_per_feature',
-        'num_embeddings_per_feature',
-        'num_features_per_rank',
-        'autoplan',
-    ]
-    for from_env_arg in from_env_args:
-        exec(f'args.{from_env_arg} = (os.getenv("{from_env_arg}", args.{from_env_arg}))')
-    args.batch_size = int(args.batch_size)
-    if args.autoplan in [1, 'True', '1']:
-        args.autoplan = True
-    elif args.autoplan in [0, 'False', '0']:
-        args.autoplan = False
-    else:
-        raise RuntimeError('error parsing env autoplan')
+    if args.from_env:
+        from_env_args = [
+            'batch_size',
+            'dataset_type',
+            'embedding_dim_per_feature',
+            'pooling_factor_per_feature',
+            'num_embeddings_per_feature',
+            'num_features_per_rank',
+            'autoplan',
+        ]
+        for from_env_arg in from_env_args:
+            exec(f'args.{from_env_arg} = (os.getenv("{from_env_arg}", args.{from_env_arg}))')
+        args.batch_size = int(args.batch_size)
+        if args.autoplan in [1, 'True', '1']:
+            args.autoplan = True
+        elif args.autoplan in [0, 'False', '0']:
+            args.autoplan = False
+        else:
+            raise RuntimeError('error parsing env autoplan')
 
     return args
 
@@ -477,15 +485,14 @@ def main(argv: List[str]) -> None:
     if args.embedding_dim_per_feature is not None:
         args.embedding_dim_per_feature = list(map(int, args.embedding_dim_per_feature.split(',')))
         args.embedding_dim = None
+        assert len(args.num_embeddings_per_feature) == len(args.embedding_dim_per_feature)
     if args.pooling_factor_per_feature is not None:
         args.pooling_factor_per_feature = list(map(int, args.pooling_factor_per_feature.split(',')))
+        assert len(args.embedding_dim_per_feature) == len(args.pooling_factor_per_feature)
     if args.num_features_per_rank is not None:
         args.num_features_per_rank = list(map(int, args.num_features_per_rank.split(',')))
+        assert len(args.pooling_factor_per_feature) == sum(args.num_features_per_rank)
 
-    # args sanity check
-    assert len(args.num_embeddings_per_feature) == len(args.embedding_dim_per_feature)
-    assert len(args.embedding_dim_per_feature) == len(args.pooling_factor_per_feature)
-    assert len(args.pooling_factor_per_feature) == sum(args.num_features_per_rank)
 
     rich.print(args)
     dist.barrier()
@@ -533,22 +540,22 @@ def main(argv: List[str]) -> None:
     ]
     topology = Topology(world_size=dist.get_world_size(), compute_device='cpu')
 
-    feature_name_to_rank = {}
-    for feature_idx, feature_name in enumerate(args.sparse_feature_names):
-        for r, num_features in enumerate(args.num_features_per_rank):
-            if feature_idx >= num_features:
-                feature_idx -= num_features
-            else:
-                feature_name_to_rank[feature_name] = r
-                break
-    feature_name_to_pooling_factor = {
-        feature_name: pooling_factor
-        for feature_name, pooling_factor 
-        in zip(args.sparse_feature_names, args.pooling_factor_per_feature)
-    }
     if args.autoplan:
         sharding_plan = None
     else:
+        feature_name_to_rank = {}
+        for feature_idx, feature_name in enumerate(args.sparse_feature_names):
+            for r, num_features in enumerate(args.num_features_per_rank):
+                if feature_idx >= num_features:
+                    feature_idx -= num_features
+                else:
+                    feature_name_to_rank[feature_name] = r
+                    break
+        feature_name_to_pooling_factor = {
+            feature_name: pooling_factor
+            for feature_name, pooling_factor 
+            in zip(args.sparse_feature_names, args.pooling_factor_per_feature)
+        }
         my_sharding_planner = MyShardingPlanner(feature_name_to_rank, feature_name_to_pooling_factor, topology)
         sharding_plan = my_sharding_planner.plan(
             train_model,
