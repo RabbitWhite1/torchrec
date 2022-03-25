@@ -20,6 +20,8 @@ from typing import (
     Type,
     Iterator,
 )
+from torchrec.test_utils.timer import Timer
+import torch.distributed as dist
 
 try:
     # For python 3.6 and below, GenericMeta will be used by
@@ -411,9 +413,11 @@ class ShardedModule(abc.ABC, nn.Module, Generic[CompIn, DistOut, Out]):
 
     # pyre-ignore[2]
     def forward(self, *input, **kwargs) -> LazyAwaitable[Out]:
-        ctx = self.create_context()
-        dist_input = self.input_dist(ctx, *input, **kwargs).wait()
-        return self.compute_and_output_dist(ctx, dist_input)
+        rank = dist.get_rank()
+        with Timer(rank, "ShardedModule.forward"):
+            ctx = self.create_context()
+            dist_input = self.input_dist(ctx, *input, **kwargs).wait()
+            return self.compute_and_output_dist(ctx, dist_input)
 
     def sparse_grad_parameter_names(
         self,

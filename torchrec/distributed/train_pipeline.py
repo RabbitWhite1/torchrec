@@ -23,10 +23,12 @@ from typing import (
 
 import torch
 from torch.autograd.profiler import record_function
+import torch.distributed as dist
 from torch.fx.node import Node
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.types import Awaitable, ShardedModuleContext
 from torchrec.streamable import Pipelineable, Multistreamable
+from torchrec.test_utils.timer import Timer
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -208,7 +210,8 @@ class PipelinedForward(Generic[DistIn, DistOut, Out]):
         assert self._name in self._context.input_dist_requests
         request = self._context.input_dist_requests[self._name]
         assert isinstance(request, Awaitable)
-        with record_function("## wait_sparse_data_dist ##"):
+        rank = dist.get_rank()
+        with record_function("## wait_sparse_data_dist ##") and Timer(rank, "input_dist_wait"):
             # Finish waiting on the dist_stream,
             # in case some delayed stream scheduling happens during the wait() call.
             with torch.cuda.stream(self._dist_stream):
@@ -227,10 +230,12 @@ class PipelinedForward(Generic[DistIn, DistOut, Out]):
 
             ctx = self._context.module_contexts[self._name]
             ctx.record_stream(cur_stream)
-
-        return self._module.compute_and_output_dist(
+        output = self._module.compute_and_output_dist(
             self._context.module_contexts[self._name], data
         )
+        # add wait to sync
+        with Timer(rank, 'output_dist_wait'):
+            return output.wait()
 
     @property
     def name(self) -> str:
@@ -495,55 +500,58 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._connected = True
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        rank = dist.get_rank()
         if not self._connected:
             self._connect(dataloader_iter)
+            Timer.enable(rank)
+        with Timer(rank, 'train_pipeline_progress_forward'):
+            if self._model.training:
+                with record_function("## zero_grad ##"):
+                    self._optimizer.zero_grad()
 
-        if self._model.training:
-            with record_function("## zero_grad ##"):
-                self._optimizer.zero_grad()
+            with record_function("## copy_batch_to_gpu ##"):
+                with torch.cuda.stream(self._memcpy_stream):
+                    batch_ip2 = next(dataloader_iter)
+                    self._batch_ip2 = batch_ip2 = _to_device(
+                        batch_ip2, self._device, non_blocking=True
+                    )
+            batch_i = cast(In, self._batch_i)
+            batch_ip1 = cast(In, self._batch_ip1)
 
-        with record_function("## copy_batch_to_gpu ##"):
-            with torch.cuda.stream(self._memcpy_stream):
-                batch_ip2 = next(dataloader_iter)
-                self._batch_ip2 = batch_ip2 = _to_device(
-                    batch_ip2, self._device, non_blocking=True
-                )
-        batch_i = cast(In, self._batch_i)
-        batch_ip1 = cast(In, self._batch_ip1)
+            with record_function("## wait_for_batch ##"):
+                _wait_for_batch(batch_i, self._data_dist_stream)
 
-        with record_function("## wait_for_batch ##"):
-            _wait_for_batch(batch_i, self._data_dist_stream)
-
-        # Forward
-        with record_function("## forward ##"):
-            # if using multiple streams (ie. CUDA), create an event in default stream
-            # before starting forward pass
-            if self._data_dist_stream:
-                event = torch.cuda.current_stream().record_event()
-            (losses, output) = cast(Tuple[torch.Tensor, Out], self._model(batch_i))
-
-        # Data Distribution
-        with record_function("## sparse_data_dist ##"):
-            with torch.cuda.stream(self._data_dist_stream):
-                _wait_for_batch(batch_ip1, self._memcpy_stream)
-                # Ensure event in default stream has been called before
-                # starting data dist
+            # Forward
+            with record_function("## forward ##"):
+                # if using multiple streams (ie. CUDA), create an event in default stream
+                # before starting forward pass
                 if self._data_dist_stream:
-                    # pyre-ignore [61]: Local variable `event` is undefined, or not always defined
-                    self._data_dist_stream.wait_event(event)
-                _start_data_dist(self._pipelined_modules, batch_ip1, self._context)
+                    event = torch.cuda.current_stream().record_event()
+                (losses, output) = cast(Tuple[torch.Tensor, Out], self._model(batch_i))
 
-        if self._model.training:
-            # Backward
-            with record_function("## backward ##"):
-                torch.sum(losses, dim=0).backward()
+            # Data Distribution
+            with record_function("## sparse_data_dist ##"):
+                with torch.cuda.stream(self._data_dist_stream):
+                    _wait_for_batch(batch_ip1, self._memcpy_stream)
+                    # Ensure event in default stream has been called before
+                    # starting data dist
+                    if self._data_dist_stream:
+                        # pyre-ignore [61]: Local variable `event` is undefined, or not always defined
+                        self._data_dist_stream.wait_event(event)
+                    _start_data_dist(self._pipelined_modules, batch_ip1, self._context)
 
-            # Update
-            with record_function("## optimizer ##"):
-                # pyre-fixme[20]: Argument `closure` expected.
-                self._optimizer.step()
+        with Timer(rank, 'train_pipeline_progress_backward'):
+            if self._model.training:
+                # Backward
+                with record_function("## backward ##"):
+                    torch.sum(losses, dim=0).backward()
 
-        self._batch_i = batch_ip1
-        self._batch_ip1 = batch_ip2
+                # Update
+                with record_function("## optimizer ##"):
+                    # pyre-fixme[20]: Argument `closure` expected.
+                    self._optimizer.step()
 
-        return output
+            self._batch_i = batch_ip1
+            self._batch_ip1 = batch_ip2
+
+            return output

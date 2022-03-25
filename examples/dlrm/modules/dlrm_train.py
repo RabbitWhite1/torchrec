@@ -37,6 +37,7 @@ class DLRMTrain(nn.Module):
             output dimension of the InteractionArch should not be manually specified
             here.
         dense_device: (Optional[torch.device]).
+        interaction_type (str): 'real' or 'cat'
 
     Call Args:
         batch: batch used with criteo and random data from torchrec.datasets
@@ -62,6 +63,7 @@ class DLRMTrain(nn.Module):
         dense_arch_layer_sizes: List[int],
         over_arch_layer_sizes: List[int],
         dense_device: Optional[torch.device] = None,
+        interaction_type: str = 'real'
     ) -> None:
         super().__init__()
         self.model = DLRM(
@@ -70,6 +72,7 @@ class DLRMTrain(nn.Module):
             dense_arch_layer_sizes=dense_arch_layer_sizes,
             over_arch_layer_sizes=over_arch_layer_sizes,
             dense_device=dense_device,
+            interaction_type=interaction_type
         )
         self.loss_fn: nn.Module = nn.BCEWithLogitsLoss()
 

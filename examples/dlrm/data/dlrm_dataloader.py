@@ -19,6 +19,7 @@ from torchrec.datasets.criteo import (
     InMemoryBinaryCriteoIterDataPipe,
 )
 from torchrec.datasets.random import RandomRecDataset
+from torchrec.datasets.synthetic import SyntheticRecDataset
 
 STAGES = ["train", "val", "test"]
 
@@ -36,6 +37,25 @@ def _get_random_dataloader(
             else None,
             manual_seed=args.seed if hasattr(args, "seed") else None,
             ids_per_feature=1,
+            num_dense=len(DEFAULT_INT_NAMES),
+        ),
+        batch_size=None,
+        batch_sampler=None,
+        pin_memory=args.pin_memory,
+        num_workers=args.num_workers if hasattr(args, "num_workers") else 0,
+    )
+
+
+def _get_synthetic_dataloader(
+    args: argparse.Namespace,
+) -> DataLoader:
+    return DataLoader(
+        SyntheticRecDataset(
+            keys=args.sparse_feature_names,
+            batch_size=args.batch_size,
+            pooling_factor_per_feature=args.pooling_factor_per_feature,
+            num_embeddings_per_feature=args.num_embeddings_per_feature,
+            manual_seed=args.seed if hasattr(args, "seed") else None,
             num_dense=len(DEFAULT_INT_NAMES),
         ),
         batch_size=None,
@@ -125,6 +145,9 @@ def get_dataloader(args: argparse.Namespace, backend: str, stage: str) -> DataLo
         not hasattr(args, "in_memory_binary_criteo_path")
         or args.in_memory_binary_criteo_path is None
     ):
-        return _get_random_dataloader(args)
+        if args.dataset_type == 'random':
+            return _get_random_dataloader(args)
+        elif args.dataset_type == 'synthetic':
+            return _get_synthetic_dataloader(args)
     else:
         return _get_in_memory_dataloader(args, stage)

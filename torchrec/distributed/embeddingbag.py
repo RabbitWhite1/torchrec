@@ -24,6 +24,7 @@ from typing import (
 import torch
 from torch import Tensor
 from torch import nn
+import torch.distributed as dist
 from torch.nn.modules.module import _IncompatibleKeys
 from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
@@ -61,6 +62,7 @@ from torchrec.modules.embedding_modules import (
 from torchrec.optim.fused import FusedOptimizerModule
 from torchrec.optim.keyed import KeyedOptimizer, CombinedOptimizer
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
+from torchrec.test_utils.timer import Timer
 
 
 def replace_placement_with_meta_device(
@@ -282,6 +284,7 @@ class ShardedEmbeddingBagCollection(
                     module.fused_optimizer.params = params
                     optims.append(("", module.fused_optimizer))
         self._optim: CombinedOptimizer = CombinedOptimizer(optims)
+        self._done = False
 
     def _create_input_dist(
         self,
@@ -332,33 +335,36 @@ class ShardedEmbeddingBagCollection(
     def input_dist(
         self, ctx: ShardedModuleContext, features: KeyedJaggedTensor
     ) -> Awaitable[SparseFeaturesList]:
-        if self._has_uninitialized_input_dist:
-            self._create_input_dist(features.keys())
-            self._has_uninitialized_input_dist = False
-        with torch.no_grad():
-            if self._has_features_permute:
-                features = features.permute(
-                    self._features_order,
-                    # pyre-ignore [6]
-                    self._features_order_tensor,
-                )
-            features_by_shards = features.split(
-                self._feature_splits,
-            )
-            awaitables = []
-            for module, features_by_shard in zip(self._input_dists, features_by_shards):
-                all2all_lengths = module(
-                    SparseFeatures(
-                        id_list_features=None
-                        if self._is_weighted
-                        else features_by_shard,
-                        id_score_list_features=features_by_shard
-                        if self._is_weighted
-                        else None,
+        rank = dist.get_rank()
+        with Timer(rank, "input_dist"):
+            if self._has_uninitialized_input_dist:
+                self._create_input_dist(features.keys())
+                self._has_uninitialized_input_dist = False
+            with torch.no_grad():
+                if self._has_features_permute:
+                    features = features.permute(
+                        self._features_order,
+                        # pyre-ignore [6]
+                        self._features_order_tensor,
                     )
+                features_by_shards = features.split(
+                    self._feature_splits,
                 )
-                awaitables.append(all2all_lengths.wait())
-            return SparseFeaturesListAwaitable(awaitables)
+                awaitables = []
+                for module, features_by_shard in zip(self._input_dists, features_by_shards):
+                    all2all_lengths = module(
+                        SparseFeatures(
+                            id_list_features=None
+                            if self._is_weighted
+                            else features_by_shard,
+                            id_score_list_features=features_by_shard
+                            if self._is_weighted
+                            else None,
+                        )
+                    )
+                    awaitables.append(all2all_lengths.wait())
+
+                return SparseFeaturesListAwaitable(awaitables)
 
     def compute(
         self,
@@ -386,21 +392,47 @@ class ShardedEmbeddingBagCollection(
     def compute_and_output_dist(
         self, ctx: ShardedModuleContext, input: SparseFeaturesList
     ) -> LazyAwaitable[KeyedTensor]:
-        if self._has_uninitialized_output_dist:
-            self._create_output_dist()
-            self._has_uninitialized_output_dist = False
-        return EmbeddingCollectionAwaitable(
-            awaitables=[
-                dist(lookup(features))
-                for lookup, dist, features in zip(
-                    self._lookups,
-                    self._output_dists,
-                    input,
+        rank = dist.get_rank()
+        with Timer(rank, "compute_and_output_dist"):
+            if self._has_uninitialized_output_dist:
+                self._create_output_dist()
+                self._has_uninitialized_output_dist = False
+            # from datetime import datetime
+            # import rich
+            # rich.print(f'{isinstance(input, Awaitable)=}, {type(input)=}')
+            # input_shape = [{k: (len(v.values()), v.lengths()) for k,v in features.id_list_features.to_dict().items()} for features in input]
+            # print(f'{input_shape=}')
+            # print(f'{len(self._lookups)=}; {len(input)=}')
+            with Timer(rank, "compute"):
+                # begin = datetime.now()
+                lookup_results = [lookup(features) for lookup, features in zip(self._lookups, input)]
+                # end = datetime.now()
+                # rich.print(end - begin)
+            with Timer(rank, "output_dist"):
+                return EmbeddingCollectionAwaitable(
+                    awaitables=[
+                        dist(lookup_result)
+                        for dist, lookup_result in zip(
+                            self._output_dists,
+                            lookup_results,
+                        )
+                    ],
+                    embedding_dims=self._embedding_dims,
+                    embedding_names=self._embedding_names,
                 )
-            ],
-            embedding_dims=self._embedding_dims,
-            embedding_names=self._embedding_names,
-        )
+            # use above so that I can record the time of lookup and output_dist independently
+            """return EmbeddingCollectionAwaitable(
+                awaitables=[
+                    dist(lookup(features))
+                    for lookup, dist, features in zip(
+                        self._lookups,
+                        self._output_dists,
+                        input,
+                    )
+                ],
+                embedding_dims=self._embedding_dims,
+                embedding_names=self._embedding_names,
+            )"""
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
